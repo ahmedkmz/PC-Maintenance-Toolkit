@@ -265,37 +265,33 @@ class Console:
             return
         spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"] if self.use_unicode else ["-", "\\", "|", "/"]
         spinner = spinner_frames[(elapsed_seconds // 5) % len(spinner_frames)]
-        bar_width = 22 if self.width < 110 else 30
-        if self.use_unicode:
-            empty_char = "░"
-            fill_char = "█"
-        else:
-            empty_char = "."
-            fill_char = "="
-        pulse_position = (elapsed_seconds // 5) % max(1, bar_width)
-        bar_cells = []
-        for index in range(bar_width):
-            if index == pulse_position or index == (pulse_position - 1) % bar_width:
-                bar_cells.append(fill_char)
-            else:
-                bar_cells.append(empty_char)
-        bar = "".join(bar_cells)
-        runtime = f"{minutes_to_human(elapsed_seconds / 60.0)}"
-        watch = f" / {minutes_to_human(timeout_seconds / 60.0)}" if timeout_seconds else ""
+        runtime = minutes_to_human(elapsed_seconds / 60.0)
+        watch = f"elapsed {runtime} / cap {minutes_to_human(timeout_seconds / 60.0)}" if timeout_seconds else f"elapsed {runtime}"
         prefix = self._fmt("[RUN   ]", "primary", "bold")
         spin = self._fmt(spinner, "accent", "bold")
-        bar_text = self._fmt(bar, "signal", "bold")
+        activity = self._fmt("active", "signal", "bold")
         label_room = 24
         label_text = self._fmt(self._clip_plain(label, label_room).ljust(label_room), "text", "bold")
-        timing = self._fmt(f"{runtime}{watch}", "muted")
-        static_len = 1 + self._visible_length(prefix) + 1 + self._visible_length(label_text) + 1 + 2 + bar_width + 2 + 1 + self._visible_length(timing)
+        timing = self._fmt(watch, "muted")
+        static_len = (
+            1
+            + self._visible_length(prefix)
+            + 1
+            + self._visible_length(label_text)
+            + 1
+            + self._visible_length(spin)
+            + 1
+            + self._visible_length(activity)
+            + 1
+            + self._visible_length(timing)
+        )
         note_room = max(0, self.width - static_len - 2)
         note_text = ""
         if note_room > 6:
             clipped_note = self._clip_plain(note, note_room)
             if clipped_note:
                 note_text = " " + self._fmt(clipped_note, "muted")
-        line = f"{prefix} {label_text} {spin} [{bar_text}] {timing}{note_text}"
+        line = f"{prefix} {label_text} {spin} {activity} {timing}{note_text}"
         plain_width = self._visible_length(line)
         padding = max(0, self.progress_last_width - plain_width)
         sys.stdout.write("\r" + line + (" " * padding))
@@ -941,6 +937,7 @@ def run_command(
         heartbeat = 0
         last_probe = 0
         last_probe_note = ""
+        last_progress_update = 0
         while True:
             try:
                 out, err = proc.communicate(timeout=5)
@@ -956,7 +953,6 @@ def run_command(
                     stderr_bytes += err or b""
                     timed_out = True
                     break
-                heartbeat += 5
                 probe_note = ""
                 if progress_probe and elapsed - last_probe >= progress_probe_interval:
                     try:
@@ -978,18 +974,19 @@ def run_command(
                             stderr_bytes += err or b""
                             timed_out = True
                             break
-                if heartbeat % heartbeat_interval == 0:
+                if elapsed - last_progress_update >= heartbeat_interval:
+                    last_progress_update = elapsed
                     note = probe_note or last_probe_note
                     if sys.stdout.isatty():
                         ctx.console.progress(
                             label=label,
-                            elapsed_seconds=heartbeat,
+                            elapsed_seconds=elapsed,
                             timeout_seconds=timeout,
                             note=note,
                         )
                     else:
                         note_suffix = f" | {note}" if note else ""
-                        ctx.logger.info("ACTION %s still running (%ss)%s", label, heartbeat, note_suffix)
+                        ctx.logger.info("ACTION %s still running (%ss)%s", label, elapsed, note_suffix)
         exit_code = proc.returncode
     except FileNotFoundError:
         error_details = f"Command not found: {command}"
@@ -1149,6 +1146,29 @@ def flatten_to_list(value: Any) -> List[Any]:
     return [value]
 
 
+def is_portable_machine(machine: Dict[str, Any]) -> bool:
+    computer = machine.get("computer", {})
+    enclosure_items = flatten_to_list(machine.get("enclosure"))
+    portable_system_types = {2, 8}
+    portable_chassis_types = {8, 9, 10, 11, 12, 14, 30, 31, 32}
+    for key in ("PCSystemTypeEx", "PCSystemType"):
+        try:
+            if int(computer.get(key, 0) or 0) in portable_system_types:
+                return True
+        except Exception:
+            continue
+    for item in enclosure_items:
+        if not isinstance(item, dict):
+            continue
+        for chassis_type in flatten_to_list(item.get("ChassisTypes")):
+            try:
+                if int(chassis_type) in portable_chassis_types:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
 def active_safety_blockers(ctx: ToolkitContext) -> List[str]:
     blockers = flatten_to_list(ctx.data.get("prechecks", {}).get("major_blockers"))
     return [str(item).strip() for item in blockers if str(item).strip()]
@@ -1305,6 +1325,7 @@ def get_baseline_snapshot(ctx: ToolkitContext) -> Dict[str, Any]:
     $cs = Get-CimInstance Win32_ComputerSystem
     $bios = Get-CimInstance Win32_BIOS
     $csProduct = Get-CimInstance Win32_ComputerSystemProduct
+    $enclosure = Get-CimInstance Win32_SystemEnclosure | Select-Object -First 1 Manufacturer, ChassisTypes
     $cpu = Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed
     $gpu = Get-CimInstance Win32_VideoController | Select-Object Name, AdapterCompatibility, DriverVersion, Status, AdapterRAM
     $disks = Get-CimInstance Win32_DiskDrive | Select-Object Model, DeviceID, InterfaceType, MediaType, SerialNumber, Size, Status
@@ -1379,7 +1400,10 @@ def get_baseline_snapshot(ctx: ToolkitContext) -> Dict[str, Any]:
             TotalPhysicalMemory = $cs.TotalPhysicalMemory
             SerialNumber = $bios.SerialNumber
             UUID = $csProduct.UUID
+            PCSystemType = $cs.PCSystemType
+            PCSystemTypeEx = $cs.PCSystemTypeEx
         }}
+        enclosure = if ($enclosure) {{ [pscustomobject]@{{ Manufacturer = $enclosure.Manufacturer; ChassisTypes = $enclosure.ChassisTypes }} }} else {{ [pscustomobject]@{{ Manufacturer = ''; ChassisTypes = @() }} }}
         timezone = $timezone
         cpu = $cpu
         gpu = $gpu
@@ -1423,12 +1447,28 @@ def detect_enterprise_management(ctx: ToolkitContext) -> Dict[str, Any]:
         "domain_name": ctx.data.get("machine", {}).get("computer", {}).get("Domain"),
         "mdm_enrolled": False,
         "sccm_present": False,
+        "enrollment_key_count": 0,
+        "enrollment_signals": [],
         "enterprise_managed": False,
     }
     if winreg:
         try:
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Enrollments") as key:
-                management["mdm_enrolled"] = winreg.QueryInfoKey(key)[0] > 0
+                subkey_count = winreg.QueryInfoKey(key)[0]
+                management["enrollment_key_count"] = subkey_count
+                signals: List[str] = []
+                for index in range(subkey_count):
+                    subkey_name = winreg.EnumKey(key, index)
+                    if not re.fullmatch(r"[0-9A-Fa-f-]{36}", subkey_name):
+                        continue
+                    subkey_path = rf"SOFTWARE\Microsoft\Enrollments\{subkey_name}"
+                    for value_name in ("ProviderID", "UPN", "DiscoveryServiceFullURL", "EnrollmentServiceUrl"):
+                        value = reg_value(winreg.HKEY_LOCAL_MACHINE, subkey_path, value_name)
+                        if value and str(value).strip():
+                            signals.append(f"{subkey_name}:{value_name}")
+                            break
+                management["enrollment_signals"] = signals[:8]
+                management["mdm_enrolled"] = bool(signals)
         except Exception:
             management["mdm_enrolled"] = False
     service_script = """
@@ -1581,7 +1621,9 @@ def perform_safety_prechecks(ctx: ToolkitContext) -> Dict[str, Any]:
     total = int(system_volume.get("Size", 0) or 0)
     free = int(system_volume.get("FreeSpace", 0) or 0)
     free_percent = round((free / total) * 100, 2) if total else 0.0
-    battery = flatten_to_list(machine.get("battery"))
+    portable_machine = is_portable_machine(machine)
+    raw_battery = flatten_to_list(machine.get("battery"))
+    battery = [item for item in raw_battery if isinstance(item, dict)] if portable_machine else []
     battery_present = bool(battery)
     battery_status = battery[0].get("BatteryStatus") if battery else None
     ac_power = battery_status in (2, 6, 7, 8, 9, 11)
@@ -1604,6 +1646,7 @@ def perform_safety_prechecks(ctx: ToolkitContext) -> Dict[str, Any]:
         "system_drive_free_bytes": free,
         "system_drive_free_percent": free_percent,
         "critically_low_space": critically_low_space,
+        "portable_machine": portable_machine,
         "battery_present": battery_present,
         "battery_status": battery_status,
         "on_ac_power": ac_power if battery_present else True,
@@ -1630,6 +1673,8 @@ def perform_safety_prechecks(ctx: ToolkitContext) -> Dict[str, Any]:
         ctx.add_finding("warning", "Pending reboot already present", "; ".join(pending), "servicing")
     else:
         ctx.console.ok("No existing pending reboot state detected")
+    if raw_battery and not portable_machine:
+        ctx.logger.info("Battery-like telemetry was reported on a non-portable chassis; battery AC heuristics were ignored.")
     if battery_present:
         if ac_power:
             ctx.console.ok("Laptop battery detected; AC power appears connected")
