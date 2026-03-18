@@ -34,7 +34,7 @@ If `reportlab` is not installed, PMT uses its built-in PDF fallback.
 
 ## Script
 
-The GitHub-ready script in this repository is:
+The script in this repository is:
 
 ```powershell
 pc-mt.py
